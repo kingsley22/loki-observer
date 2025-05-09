@@ -10,6 +10,7 @@
               <span class="comment">(current top block)</span>
           {%endif%}
       </h4>
+      <h4 style="margin:5px"><label>L2 Height:</label> {{block_header.l2_height}}</h4>
       <h4 style="margin:5px" class="prev_next_block">
           {%if block_header.height > 0%}
               <a href="/block/{{block_header.height-1}}{%if details_html%}/1{%endif%}">⏴ Block {{block_header.height-1}} <span class="comment">({{block_header.prev_hash | ellipsize(8,3)}})</span></a>
@@ -32,7 +33,8 @@
 
         <span><label>Major/minor version:</label> {{block_header.major_version}}.{{block_header.minor_version}}</span>
 
-        <span><label>Block size:</label> {{block_header.block_size | si}}B</span>
+        <span><label>Block size:</label> {{block_header.block_size | si}}B
+            ({{(block_header.block_size - block_header.block_weight) | si}}B block + {{block_header.block_weight | si}}B txs)</span>
 
         {%if 'nonce' in block_header and block_header['nonce'] != 0%}
             <span title="Miner nonce: {{block_header.nonce}}"><label>Block type:</label> Mined ⛏</span>
@@ -43,33 +45,33 @@ Cumulative difficulty {{block_header.cumulative_difficulty}}"><label>Difficulty:
             <span title="Pulse random value: {{block.info.pulse.random_value}}
 Validator bits: {{"{:011b}".format(block.info.pulse.validator_bitset)}}"><label>Block type:</label> Pulse 💓</span>
             {%if block.info.pulse.round > 0%}
-                <span title="When &gt; 0 this indicates how many Service Node rounds failed to produce a valid, signed Pulse block in time">
+                <span title="When &gt; 0 this indicates how many Session Node rounds failed to produce a valid, signed Pulse block in time">
                     <title>Pulse round:</title> {{block.info.pulse.round}}
                 </span>
             {%endif%}
         {%endif%}
 
         {%set sum_burned = transactions | selectattr('extra.burn_amount') | sum(attribute='extra.burn_amount') %}
-        {%set sum_fees = transactions | selectattr('info.rct_signatures') | selectattr('info.rct_signatures.txnFee') | sum(attribute='info.rct_signatures.txnFee') - sum_burned%}
+        {%set sum_fees = transactions | selectattr('rct_signatures') | selectattr('rct_signatures.txnFee') | sum(attribute='rct_signatures.txnFee') - sum_burned%}
 
-        <span title="{{(block_header.reward - sum_fees) | oxen(fixed=True)}} created in this block.{%if sum_fees > 0%}
+        <span title="{{(block_header.reward - sum_fees) | cash(fixed=True)}} created in this block.{%if sum_fees > 0%}
 
-Note that this value does not include earned transaction fees ({{sum_fees | oxen(fixed=True, decimals=4)}}){%endif%}"><label>Block reward:</label>
-        {{(block_header.reward - sum_fees) | oxen(decimals=4)}}</span>
+Note that this value does not include earned transaction fees ({{sum_fees | cash(fixed=True, decimals=4)}}){%endif%}"><label>Block reward:</label>
+        {{(block_header.reward - sum_fees) | cash(decimals=4)}}</span>
 
         {%if sum_fees > 0%}
-            <span title="Earned TX fees: {{sum_fees | oxen(fixed=True)}}"><label>Block TX fees:</label> {{ sum_fees | oxen(fixed=True, decimals=4) }}</span>
+            <span title="Earned TX fees: {{sum_fees | cash(tag_name='OXEN', fixed=True)}}"><label>Block TX fees:</label> {{ sum_fees | cash(fixed=True, decimals=4) }}</span>
         {%endif%}
 
         {%if sum_burned > 0%}
-            <span title="{{sum_burned | oxen(fixed=True)}} burned in the transactions included in block">
+            <span title="{{sum_burned | cash(tag_name='OXEN', fixed=True)}} burned in the transactions included in block">
                 <label>Burned fees:</label>
-                {{sum_burned | oxen(decimals=4)}} <span class="icon">🔥</span>
+                {{sum_burned | cash(tag_name='OXEN', decimals=4)}} <span class="icon">🔥</span>
             </span>
         {%endif%}
 
         {%if miner_tx and miner_tx.extra.sn_winner%}
-          <span><label>Service Node Winner:</label>
+          <span><label>Session Node Winner:</label>
             {%if miner_tx.extra.sn_winner == "0000000000000000000000000000000000000000000000000000000000000000"%}
               None
             {%else%}
@@ -91,9 +93,9 @@ Note that this value does not include earned transaction fees ({{sum_fees | oxen
         </tr>
         <tr>
             <td><a href="/tx/{{miner_tx.tx_hash}}">{{miner_tx.tx_hash}}</a></td>
-            <td>{{miner_tx.info.vout | sum(attribute='amount') | oxen}}</td>
+            <td>{{miner_tx.vout | sum(attribute='amount') | cash(tag_name='OXEN')}}</td>
             <td>{{miner_tx.size}}</td>
-            <td>{{miner_tx.info.version}}</td>
+            <td>{{miner_tx.version}}</td>
         </tr>
     </table>
     {%endif%}
@@ -122,7 +124,7 @@ Note that this value does not include earned transaction fees ({{sum_fees | oxen
                   <td><a href="/tx/{{tx.tx_hash}}">{{tx.tx_hash}}</a></td>
                   <td>{{fee.display(tx)}}</td>
                   <td></td>
-                  <td>{{tx.info.vin | length}}/{{tx.info.vout | length}}</td>
+                  <td>{{tx.vin | length}}/{{tx.vout | length}}</td>
                   <td>{{tx.size | si}}B</td>
                 </tr>
             {% endfor %}

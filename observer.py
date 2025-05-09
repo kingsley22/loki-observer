@@ -124,8 +124,8 @@ def format_si(value):
         i += 1
     return filter_round(value) + '{}'.format(si_suffix[i])
 
-@app.template_filter('oxen')
-def format_oxen(atomic, tag=True, fixed=False, decimals=9, zero=None):
+@app.template_filter('cash')
+def format_oxen(atomic, tag_name='SENT', tag=True, fixed=False, decimals=9, zero=None):
     """Formats an atomic current value as a human currency value.
     tag - if False then don't append " OXEN"
     fixed - if True then don't strip insignificant trailing 0's and '.'
@@ -139,7 +139,7 @@ def format_oxen(atomic, tag=True, fixed=False, decimals=9, zero=None):
         if not fixed and decimals > 0:
             disp = disp.rstrip('0').rstrip('.')
     if tag:
-        disp += ' OXEN'
+        disp += ' ' + tag_name
     return disp
 
 # For some inexplicable reason some hex fields are provided as array of byte integer values rather
@@ -194,7 +194,7 @@ def get_sns(sns_future, info_future):
     sn_states = sns_future.get()
     sn_states = sn_states['service_node_states'] if 'service_node_states' in sn_states else []
     for sn in sn_states:
-        sn['contribution_open'] = sn['staking_requirement'] - sn['total_reserved']
+        sn['contribution_open'] = sn['staking_requirement'] - sn.get('total_reserved', sn['total_contributed'])
         sn['contribution_required'] = sn['staking_requirement'] - sn['total_contributed']
         sn['num_contributions'] = sum(len(x['locked_contributions']) for x in sn['contributors'] if 'locked_contributions' in x)
 
@@ -228,23 +228,47 @@ def get_quorums(quorums_future):
     return quo
 
 def get_mempool_future(omq, oxend):
-    return FutureJSON(omq, oxend, 'rpc.get_transaction_pool', 5, args={"tx_extra":True, "stake_info":True})
+    return FutureJSON(omq, oxend, 'rpc.get_transaction_pool', 5, args={"tx_extra":True, "tx_extra_raw": True, "stake_info":True})
 
 def parse_mempool(mempool_future):
     # mempool RPC return values are about as nasty as can be.  For each mempool tx, we get back
     # *both* binary+hex encoded values and JSON-encoded values slammed into a string, which means we
     # have to invoke an *extra* JSON parser for each tx.  This is terrible.
     mp = mempool_future.get()
+
+    # Oxen 10 and earlier return as 'transactions', 11+ returns 'txs' to unify with the
+    # `get_transactions` endpoint, so rewrite the Oxen 10 response to look like oxen 11+:
     if 'transactions' in mp:
+        rename = {
+                'id_hash': 'tx_hash',
+                'blob_size': 'size',
+                'max_used_block_id_hash': 'max_used_block',
+                'max_used_block_height': 'max_used_height',
+                'last_failed_id_hash': 'last_failed_hash',
+                'receive_time': 'received_timestamp',
+                'tx_blob': 'data',
+        }
+        for tx in mp['transactions']:
+            # Apparently, in Oxen 10 and earlier, *some* tx info is in the outer request, and *some*
+            # other info is inside a double-encoded "tx_json", so we have to merge them together.
+            # This is truly horrible, even by Monero standards.
+            info = json.loads(tx["tx_json"])
+            info['tx_extra_raw'] = bytes_to_hex(info['extra'])
+            del info['extra']
+            tx.update(info)
+
+            for from_k, to_k in rename.items():
+                tx[to_k] = tx.pop(from_k)
+
+        mp['txs'] = mp.pop('transactions')
+
+    if 'txs' in mp:
         # If we have a cached value we have already sorted it
         if '_sorted' not in mp:
-            mp['transactions'].sort(key=lambda tx: (tx['receive_time'], tx['id_hash']))
+            mp['txs'].sort(key=lambda tx: (tx['received_timestamp'], tx['tx_hash']))
             mp['_sorted'] = True
-
-        for tx in mp['transactions']:
-            tx['info'] = json.loads(tx["tx_json"])
     else:
-        mp['transactions'] = []
+        mp['txs'] = []
     return mp
 
 
@@ -293,8 +317,11 @@ def main(refresh=None, page=0, per_page=None, first=None, last=None, style=None)
     # We have some chained request dependencies here and below, so get() them as needed; all other
     # non-dependent requests should already have a future initiated above so that they can
     # potentially run in parallel.
-    info = inforeq.get()
-    height = info['height']
+    info             = inforeq.get()
+    height           = info['height']
+    info['testnet']  = info['nettype'] == 'testnet'
+    info['stagenet'] = info['nettype'] == 'stagenet'
+    info['devnet']   = info['nettype'] == 'devnet'
 
     # Permalinked block range:
     if first is not None and last is not None and 0 <= first <= last and last <= first + 99:
@@ -302,6 +329,8 @@ def main(refresh=None, page=0, per_page=None, first=None, last=None, style=None)
         if end_height - start_height + 1 != per_page:
             per_page = end_height - start_height + 1;
             custom_per_page = '/{}'.format(per_page)
+        if start_height > height:
+            flask.abort(404)
         # We generally can't get a perfect page number because our range (e.g. 5-14) won't line up
         # with pages (e.g. 10-19, 0-19), so just get as close as we can.  Next/Prev page won't be
         # quite right, but they'll be within half a page.
@@ -327,17 +356,16 @@ def main(refresh=None, page=0, per_page=None, first=None, last=None, style=None)
             if 'tx_hashes' in b:
                 txids += b['tx_hashes']
         if txids:
-            txs = parse_txs(tx_req(omq, oxend, txids, cache_key='mempool').get())
+            txs = parse_txs(tx_req(omq, oxend, txids, cache_key='recent').get())
             i = 0
             for tx in txs:
-                if 'vin' in tx['info'] and len(tx['info']['vin']) == 1 and 'gen' in tx['info']['vin'][0]:
+                if 'vin' in tx and len(tx['vin']) == 1 and 'gen' in tx['vin'][0]:
                     tx['coinbase'] = True
                 # TXs should come back in the same order so we can just skip ahead one when the block
                 # height changes rather than needing to search for the block
                 if blocks[i]['height'] != tx['block_height']:
                     i += 1
                     while i < len(blocks) and blocks[i]['height'] != tx['block_height']:
-                        print("Something getting wrong: missing txes?", file=sys.stderr)
                         i += 1
                     if i >= len(blocks):
                         print("Something getting wrong: have leftover txes")
@@ -347,12 +375,17 @@ def main(refresh=None, page=0, per_page=None, first=None, last=None, style=None)
     # Clean up the SN data a bit to make things easier for the templates
     awaiting_sns, active_sns, inactive_sns = get_sns(sns, inforeq)
 
+    accrued = accrued.get()
+    accrued_total = (
+            sum(amt for wallet, amt in accrued['balances'].items()) if 'balances' in accrued else
+            sum(accrued['amounts']))
+
     return flask.render_template('index.html',
             info=info,
             stake=stake.get(),
             fees=base_fee.get(),
             emission=coinbase.get(),
-            accrued_total=sum(accrued.get()['amounts']),
+            accrued_total=accrued_total,
             hf=hfinfo.get(),
             active_sns=active_sns,
             active_swarms=len(set(x['swarm_id'] for x in active_sns)),
@@ -398,8 +431,9 @@ def tx_req(omq, oxend, txids, cache_key='single', **kwargs):
     return FutureJSON(omq, oxend, 'rpc.get_transactions', cache_seconds=10, cache_key=cache_key,
             args={
                 "txs_hashes": txids,
-                "decode_as_json": True,
+                "decode_as_json": True, # Can drop once we no longer need Oxen 10 support
                 "tx_extra": True,
+                "tx_extra_raw": True,
                 "prune": True,
                 "stake_info": True,
                 },
@@ -586,9 +620,9 @@ def show_sn(pubkey, more_details=False):
     # Number of staked contributions
     sn['num_contributions'] = sum(len(x["locked_contributions"]) for x in sn["contributors"] if "locked_contributions" in x)
     # Number of unfilled, reserved contribution spots:
-    sn['num_reserved_spots'] = sum(x["amount"] < x["reserved"] for x in sn["contributors"])
+    sn['num_reserved_spots'] = sum('reserved' in x and x["amount"] < x["reserved"] for x in sn["contributors"])
     # Available open contribution spots:
-    sn['num_open_spots'] = 0 if sn['total_reserved'] >= sn['staking_requirement'] else max(0, 4 - sn['num_contributions'] - sn['num_reserved_spots'])
+    sn['num_open_spots'] = 0 if sn.get('total_reserved', sn['total_contributed']) >= sn['staking_requirement'] else max(0, 4 - sn['num_contributions'] - sn['num_reserved_spots'])
 
     if more_details:
         formatter = HtmlFormatter(cssclass="syntax-highlight", style="paraiso-dark")
@@ -635,14 +669,18 @@ def parse_txs(txs_rpc):
         return []
 
     for tx in txs_rpc['txs']:
-        if 'info' not in tx:
+        if 'type' not in tx and 'as_json' in tx:
+            # Pre Oxen 11 scrammed the details into "as_json" that we have to parse again
             # We have serialized JSON data inside a field in the JSON, because of oxend's
             # multiple incompatible JSON generators 🤮:
-            tx['info'] = json.loads(tx["as_json"])
+            info = json.loads(tx["as_json"])
             del tx['as_json']
             # The "extra" field inside as_json is retardedly in per-byte integer values,
             # convert it to a hex string 🤮:
-            tx['info']['extra'] = bytes_to_hex(tx['info']['extra'])
+            info['tx_extra_raw'] = bytes_to_hex(info['extra'])
+            del info['extra']
+            tx.update(info)
+
     return txs_rpc['txs']
 
 
@@ -656,7 +694,9 @@ def get_block_txs_future(omq, oxend, block):
     if 'info' not in block:
         try:
             block['info'] = json.loads(block["json"])
-            del block['info']['miner_tx']  # Doesn't include enough for us, we fetch it separately with extra interpretation instead
+            if 'miner_tx' in block['info']:
+                # Doesn't include enough for us, we fetch it separately with extra interpretation instead
+                del block['info']['miner_tx']
             del block["json"]
         except Exception as e:
             print("Something getting wrong: cannot parse block json for block {}: {}".format(block_height, e), file=sys.stderr)
@@ -742,19 +782,19 @@ def show_tx(txid, more_details=False):
 
     # If this is a state change, see if we have the quorum stored to provide context
     testing_quorum = None
-    if tx['info']['version'] >= 4 and 'sn_state_change' in tx['extra']:
+    if tx['version'] >= 4 and 'sn_state_change' in tx['extra']:
         testing_quorum = FutureJSON(omq, oxend, 'rpc.get_quorum_state', 60, cache_key='tx_state_change',
                 args={ 'quorum_type': 0, 'start_height': tx['extra']['sn_state_change']['height'] })
 
     kindex_info = {} # { amount => { keyindex => {output-info} } }
     block_info_req = None
-    if 'vin' in tx['info']:
-        if len(tx['info']['vin']) == 1 and 'gen' in tx['info']['vin'][0]:
+    if 'vin' in tx:
+        if len(tx['vin']) == 1 and 'gen' in tx['vin'][0]:
             tx['coinbase'] = True
-        elif tx['info']['vin'] and config.enable_mixins_details:
+        elif tx['vin'] and config.enable_mixins_details:
             # Load output details for all outputs contained in the inputs
             outs_req = []
-            for inp in tx['info']['vin']:
+            for inp in tx['vin']:
                 # Key positions are stored as offsets from the previous index rather than indices,
                 # so de-delta them back into indices:
                 if 'key_offsets' in inp['key'] and 'key_indices' not in inp['key']:
@@ -766,7 +806,7 @@ def show_tx(txid, more_details=False):
                         kis.append(kbase)
                     del inp['key']['key_offsets']
 
-            outs_req = [{"amount":inp['key']['amount'], "index":ki} for inp in tx['info']['vin'] for ki in inp['key']['key_indices']]
+            outs_req = [{"amount":inp['key']['amount'], "index":ki} for inp in tx['vin'] for ki in inp['key']['key_indices']]
             outputs = FutureJSON(omq, oxend, 'rpc.get_outs', args={
                 'get_txid': True,
                 'outputs': outs_req,
@@ -778,7 +818,7 @@ def show_tx(txid, more_details=False):
                     'heights': [o["height"] for o in outputs]
                 })
                 i = 0
-                for inp in tx['info']['vin']:
+                for inp in tx['vin']:
                     amount = inp['key']['amount']
                     if amount not in kindex_info:
                         kindex_info[amount] = {}
